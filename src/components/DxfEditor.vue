@@ -293,6 +293,12 @@ const viewBounds = ref<{ minX: number; minY: number; maxX: number; maxY: number 
   maxY: 100,
 })
 const dragging = ref<{ id: string; ptIndex: number } | null>(null)
+const draggingPolyline = ref<{
+  pointerId: number
+  id: string
+  start: { x: number; y: number }
+  basePoints: Polyline
+} | null>(null)
 const panning = ref<{
   pointerId: number
   start: { x: number; y: number }
@@ -306,6 +312,7 @@ const showGuides = ref(true)
 const showMText = ref(true)
 const svgEl = ref<SVGSVGElement | null>(null)
 const copyState = ref<'idle' | 'ok' | 'fail'>('idle')
+const pointCopyState = ref<'idle' | 'ok' | 'fail'>('idle')
 const fileName = ref<string | null>(null)
 const parsedDxf = ref<unknown | null>(null)
 const jsonDraft = ref('')
@@ -399,6 +406,16 @@ const pointSampleStep = computed(() => {
   if (pointMode.value === 'hidden') return Infinity
   if (pointMode.value === 'all') return 1
   return total > maxPoints ? Math.ceil(total / maxPoints) : 1
+})
+
+const pointNudgeStep = ref(1)
+
+const selectedPointMeta = computed(() => {
+  const s = selected.value
+  if (!s) return null
+  const it = findItemById(s.id)
+  if (!it) return null
+  return { id: it.id, layer: it.layer, ptIndex: s.ptIndex, total: it.points.length }
 })
 
 const polylineStrokeStep = computed(() => {
@@ -808,8 +825,7 @@ function focusPolyline(id: string) {
     if (x > maxX) maxX = x
     if (y > maxY) maxY = y
   }
-  const pad = Math.max((maxX - minX) * 0.1, (maxY - minY) * 0.1, 10)
-  viewBounds.value = { minX: minX - pad, minY: minY - pad, maxX: maxX + pad, maxY: maxY + pad }
+  setViewToContentBounds({ minX, minY, maxX, maxY }, 0.1)
 }
 
 function focusEntityIndex(index: number) {
@@ -850,6 +866,7 @@ function initLayerStateFromItems(forceSelectAllIfEmpty: boolean) {
 }
 
 function shouldRenderPoint(id: string, ptIndex: number, ptTotal: number) {
+  if (selectedItemId.value === id) return true
   if (pointMode.value === 'hidden') return false
   const step = pointSampleStep.value
   if (step <= 1) return true
@@ -888,6 +905,57 @@ function clientToModel(ev: PointerEvent | MouseEvent) {
   return { x, y }
 }
 
+function setViewToContentBounds(
+  bounds: { minX: number; minY: number; maxX: number; maxY: number },
+  padRatio: number,
+) {
+  let { minX, minY, maxX, maxY } = bounds
+  if (![minX, minY, maxX, maxY].every((n) => Number.isFinite(n))) return
+
+  if (maxX < minX) [minX, maxX] = [maxX, minX]
+  if (maxY < minY) [minY, maxY] = [maxY, minY]
+
+  let w = maxX - minX
+  let h = maxY - minY
+  let span = Math.max(w, h)
+  if (!Number.isFinite(span) || span <= 0) span = 100
+
+  const pr = Number.isFinite(padRatio) ? Math.max(0, Math.min(0.5, padRatio)) : 0.05
+  const pad = span * pr
+
+  minX -= pad
+  maxX += pad
+  minY -= pad
+  maxY += pad
+
+  w = maxX - minX
+  h = maxY - minY
+  if (!Number.isFinite(w) || !Number.isFinite(h) || w <= 0 || h <= 0) return
+
+  const svg = svgEl.value
+  const vw = svg?.clientWidth ?? 0
+  const vh = svg?.clientHeight ?? 0
+  if (vw > 0 && vh > 0) {
+    const viewportRatio = vw / vh
+    const contentRatio = w / h
+    if (Number.isFinite(viewportRatio) && viewportRatio > 0 && Number.isFinite(contentRatio)) {
+      if (contentRatio > viewportRatio) {
+        const targetH = w / viewportRatio
+        const extra = targetH - h
+        minY -= extra / 2
+        maxY += extra / 2
+      } else if (contentRatio < viewportRatio) {
+        const targetW = h * viewportRatio
+        const extra = targetW - w
+        minX -= extra / 2
+        maxX += extra / 2
+      }
+    }
+  }
+
+  viewBounds.value = { minX, minY, maxX, maxY }
+}
+
 function fitToContent() {
   const b = bboxBounds.value
   if (
@@ -895,13 +963,7 @@ function fitToContent() {
     layerFilterSet.value.size > 0 &&
     layerFilterSet.value.size === polylineLayerCounts.value.length
   ) {
-    const pad = Math.max((b.maxX - b.minX) * 0.05, (b.maxY - b.minY) * 0.05, 10)
-    viewBounds.value = {
-      minX: b.minX - pad,
-      minY: b.minY - pad,
-      maxX: b.maxX + pad,
-      maxY: b.maxY + pad,
-    }
+    setViewToContentBounds(b, 0.05)
     return
   }
 
@@ -921,8 +983,7 @@ function fitToContent() {
     if (x > maxX) maxX = x
     if (y > maxY) maxY = y
   }
-  const pad = Math.max((maxX - minX) * 0.05, (maxY - minY) * 0.05, 10)
-  viewBounds.value = { minX: minX - pad, minY: minY - pad, maxX: maxX + pad, maxY: maxY + pad }
+  setViewToContentBounds({ minX, minY, maxX, maxY }, 0.05)
 }
 
 function onFileSelected(e: Event) {
@@ -1033,6 +1094,17 @@ function onPointerMove(ev: PointerEvent) {
     }
     return
   }
+  if (draggingPolyline.value) {
+    const p = clientToModel(ev)
+    if (!p) return
+    const d = draggingPolyline.value
+    const it = findItemById(d.id)
+    if (!it) return
+    const dx = p.x - d.start.x
+    const dy = p.y - d.start.y
+    it.points = d.basePoints.map(([x, y]) => [x + dx, y + dy])
+    return
+  }
   if (!dragging.value || polylineItems.value.length === 0) return
   const { id, ptIndex } = dragging.value
   const p = clientToModel(ev)
@@ -1056,10 +1128,14 @@ function onPointerUp(ev: PointerEvent) {
   if (dragging.value) {
     svgEl.value?.releasePointerCapture(ev.pointerId)
   }
+  if (draggingPolyline.value) {
+    svgEl.value?.releasePointerCapture(ev.pointerId)
+  }
   if (panning.value) {
     svgEl.value?.releasePointerCapture(ev.pointerId)
   }
   dragging.value = null
+  draggingPolyline.value = null
   panning.value = null
   latestDrag = null
   if (dragRaf) {
@@ -1072,10 +1148,14 @@ function onPointerCancel(ev: PointerEvent) {
   if (dragging.value) {
     svgEl.value?.releasePointerCapture(ev.pointerId)
   }
+  if (draggingPolyline.value) {
+    svgEl.value?.releasePointerCapture(ev.pointerId)
+  }
   if (panning.value) {
     svgEl.value?.releasePointerCapture(ev.pointerId)
   }
   dragging.value = null
+  draggingPolyline.value = null
   panning.value = null
   latestDrag = null
   if (dragRaf) {
@@ -1096,6 +1176,24 @@ function onCanvasPointerDown(ev: PointerEvent) {
   selected.value = null
   selectedItemId.value = null
   selectedEntityIndex.value = null
+}
+
+function onPolylinePointerDown(id: string, ev: PointerEvent) {
+  if (ev.button !== 0) return
+  if (!ev.altKey && !ev.ctrlKey && !ev.metaKey) return
+  const p = clientToModel(ev)
+  if (!p) return
+  const it = findItemById(id)
+  if (!it) return
+  selectPolyline(id)
+  selected.value = null
+  draggingPolyline.value = {
+    pointerId: ev.pointerId,
+    id,
+    start: p,
+    basePoints: it.points.map((x) => x),
+  }
+  svgEl.value?.setPointerCapture(ev.pointerId)
 }
 
 function onWheel(ev: WheelEvent) {
@@ -1188,9 +1286,84 @@ function deleteSelectedPoint() {
   selected.value = { id: s.id, ptIndex: Math.max(0, s.ptIndex - 1) }
 }
 
+function nudgeSelectedPoint(dx: number, dy: number, mult = 1) {
+  const s = selected.value
+  if (!s) return
+  const it = findItemById(s.id)
+  const p = it?.points?.[s.ptIndex]
+  if (!it || !p) return
+  const step = Math.max(0, Number(pointNudgeStep.value) || 0)
+  if (!Number.isFinite(step) || step <= 0) return
+  const nx = p[0] + dx * step * mult
+  const ny = p[1] + dy * step * mult
+  if (!Number.isFinite(nx) || !Number.isFinite(ny)) return
+  it.points[s.ptIndex] = [nx, ny]
+}
+
+async function copySelectedPoint() {
+  const p = selectedPoint.value
+  if (!p) return
+  pointCopyState.value = 'idle'
+  const text = `${p[0]},${p[1]}`
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text)
+    } else {
+      const ta = document.createElement('textarea')
+      ta.value = text
+      ta.style.position = 'fixed'
+      ta.style.left = '-10000px'
+      ta.style.top = '0'
+      document.body.appendChild(ta)
+      ta.focus()
+      ta.select()
+      document.execCommand('copy')
+      ta.remove()
+    }
+    pointCopyState.value = 'ok'
+    setTimeout(() => (pointCopyState.value = 'idle'), 1200)
+  } catch {
+    pointCopyState.value = 'fail'
+    setTimeout(() => (pointCopyState.value = 'idle'), 1200)
+  }
+}
+
+function insertPointAroundSelected(mode: 'before' | 'after') {
+  const s = selected.value
+  if (!s) return
+  const it = findItemById(s.id)
+  if (!it) return
+  const pl = it.points
+  if (pl.length < 2) return
+  const i = s.ptIndex
+  const prevIndex = Math.max(0, i - 1)
+  const nextIndex = Math.min(pl.length - 1, i + 1)
+  const a = mode === 'before' ? pl[prevIndex] : pl[i]
+  const b = mode === 'before' ? pl[i] : pl[nextIndex]
+  const mid: Point = [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2]
+  const insertAt = mode === 'before' ? i : i + 1
+  pl.splice(insertAt, 0, mid)
+  selected.value = { id: s.id, ptIndex: insertAt }
+}
+
 function onKeyDown(ev: KeyboardEvent) {
+  const tag = (ev.target as HTMLElement | null)?.tagName?.toLowerCase()
+  if (tag === 'input' || tag === 'textarea' || tag === 'select') return
   if (ev.key === 'Delete' || ev.key === 'Backspace') {
     deleteSelectedPoint()
+  }
+  if (ev.key === 'ArrowLeft') {
+    ev.preventDefault()
+    nudgeSelectedPoint(-1, 0, ev.shiftKey ? 10 : 1)
+  } else if (ev.key === 'ArrowRight') {
+    ev.preventDefault()
+    nudgeSelectedPoint(1, 0, ev.shiftKey ? 10 : 1)
+  } else if (ev.key === 'ArrowUp') {
+    ev.preventDefault()
+    nudgeSelectedPoint(0, 1, ev.shiftKey ? 10 : 1)
+  } else if (ev.key === 'ArrowDown') {
+    ev.preventDefault()
+    nudgeSelectedPoint(0, -1, ev.shiftKey ? 10 : 1)
   }
 }
 
@@ -1617,6 +1790,9 @@ onUnmounted(() => {
           <span class="chip" v-if="parsing">解析中…</span>
           <span class="chip" v-else-if="parseMs !== null">解析 {{ parseMs }}ms</span>
           <span class="chip">折线 {{ counts.polylines }} / 点 {{ counts.points }}</span>
+          <span class="chip" v-if="counts.polylines > 0"
+            >按住 Alt/Ctrl/⌘ 拖动线：移动整条线（含单条线/折线）</span
+          >
         </div>
         <svg
           ref="svgEl"
@@ -1664,6 +1840,7 @@ onUnmounted(() => {
                 undefined
               "
               style="cursor: pointer"
+              @pointerdown="onPolylinePointerDown(it.id, $event)"
               @click.stop="selectPolyline(it.id)"
               @dblclick="insertPointOnPolyline(it.id, $event)"
             />
@@ -1917,7 +2094,46 @@ onUnmounted(() => {
             </div>
             <div class="layer-group">
               <div class="layer-group-title">操作</div>
-              <div class="hint">Shift+拖拽平移 / 滚轮缩放 / 双击折线插点</div>
+              <div class="hint">
+                Shift+拖拽平移 / 滚轮缩放 / 双击折线插点 / Alt(Ctrl/⌘)+拖线移动整条线
+              </div>
+            </div>
+            <div class="layer-group">
+              <div class="layer-group-title">点编辑</div>
+              <template v-if="selectedPoint && selectedPointMeta">
+                <div class="hint">
+                  当前：{{ selectedPointMeta.layer }} / {{ selectedPointMeta.ptIndex + 1 }} /
+                  {{ selectedPointMeta.total }}
+                </div>
+                <label class="layer-field">
+                  <span>步长</span>
+                  <input type="number" v-model.number="pointNudgeStep" min="0" step="0.1" />
+                </label>
+                <div class="mini-actions">
+                  <button type="button" class="btn" @click="nudgeSelectedPoint(-1, 0)">←</button>
+                  <button type="button" class="btn" @click="nudgeSelectedPoint(0, 1)">↑</button>
+                  <button type="button" class="btn" @click="nudgeSelectedPoint(0, -1)">↓</button>
+                  <button type="button" class="btn" @click="nudgeSelectedPoint(1, 0)">→</button>
+                </div>
+                <div class="mini-actions">
+                  <button type="button" class="btn" @click="copySelectedPoint">复制坐标</button>
+                  <button type="button" class="btn" @click="insertPointAroundSelected('before')">
+                    前插点
+                  </button>
+                  <button type="button" class="btn" @click="insertPointAroundSelected('after')">
+                    后插点
+                  </button>
+                  <button type="button" class="danger" @click="deleteSelectedPoint">删除点</button>
+                </div>
+                <div class="row status">
+                  <span v-if="pointCopyState === 'ok'" class="status-chip ok">已复制</span>
+                  <span v-else-if="pointCopyState === 'fail'" class="status-chip fail"
+                    >复制失败</span
+                  >
+                </div>
+                <div class="hint">拖拽点 / Delete 删除 / 方向键微调（Shift×10）</div>
+              </template>
+              <div v-else class="hint">点击红点选中后可编辑：微调/插点/删除</div>
             </div>
           </div>
         </div>
